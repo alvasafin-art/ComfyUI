@@ -312,6 +312,21 @@ def cuda_device_context(device):
         if prev is not None:
             torch.cuda.set_device(prev)
 
+def xpu_get_memory_info(dev, mem_reserved):
+    try:
+        mem_free_xpu, mem_total_xpu = torch.xpu.mem_get_info(dev)
+        if (
+            mem_total_xpu <= 0
+            or mem_free_xpu < 0
+            or mem_free_xpu > mem_total_xpu
+            or mem_total_xpu - mem_free_xpu < mem_reserved
+        ):
+            raise RuntimeError("Inconsistent XPU memory information")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        mem_total_xpu = torch.xpu.get_device_properties(dev).total_memory
+        mem_free_xpu = mem_total_xpu - mem_reserved
+    return mem_free_xpu, mem_total_xpu
+
 def get_total_memory(dev=None, torch_total_too=False):
     global directml_enabled
     if dev is None:
@@ -327,7 +342,7 @@ def get_total_memory(dev=None, torch_total_too=False):
         elif is_intel_xpu():
             stats = torch.xpu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
-            mem_total_xpu = torch.xpu.get_device_properties(dev).total_memory
+            _, mem_total_xpu = xpu_get_memory_info(dev, mem_reserved)
             mem_total_torch = mem_reserved
             mem_total = mem_total_xpu
         elif is_ascend_npu():
@@ -490,28 +505,36 @@ try:
         except:
             rocm_version = (6, -1)
 
-        def aotriton_supported(gpu_arch):
-            path = torch.__path__[0]
-            path = os.path.join(os.path.join(path, "lib"), "aotriton.images")
-            gfx = set(map(lambda a: a[4:], filter(lambda a: a.startswith("amd-gfx"), os.listdir(path))))
-            if gpu_arch in gfx:
-                return True
-            if "{}x".format(gpu_arch[:-1]) in gfx:
-                return True
-            if "{}xx".format(gpu_arch[:-2]) in gfx:
-                return True
-            return False
+        def aotriton_supported():
+            """Whether pytorch reports flash attention as usable on this gpu.
+
+            can_use_flash_attention() evaluates runtime eligibility for the given
+            parameters; on a ROCm build that includes checking the gpu arch against the
+            kernel images AOTriton was compiled for. Querying it avoids assuming where
+            those images live inside the torch install. The probe tensor is shaped and
+            typed to pass the unrelated SDPA checks, so False means no hardware support
+            rather than a rejected shape.
+            """
+            try:
+                if not torch.backends.cuda.is_flash_attention_available():  # not built with flash attention
+                    return False
+                q = torch.empty((1, 1, 8, 64), dtype=torch.float16, device=get_torch_device())
+                params = torch.backends.cuda.SDPAParams(q, q, q, None, 0.0, False, False)
+                return torch.backends.cuda.can_use_flash_attention(params, False)
+            except (AttributeError, RuntimeError, TypeError) as e:
+                logging.warning("Could not query aotriton support: {}".format(e))
+                return False
 
         logging.info("AMD arch: {}".format(arch))
         logging.info("ROCm version: {}".format(rocm_version))
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
-            if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
+            if aotriton_supported():  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
                     if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
                 if rocm_version >= (7, 0):
-                   if any((a in arch) for a in ["gfx1200", "gfx1201"]):
-                       ENABLE_PYTORCH_ATTENTION = True
+                    if any((a in arch) for a in ["gfx1200", "gfx1201"]):
+                        ENABLE_PYTORCH_ATTENTION = True
         if torch_version_numeric >= (2, 7) and rocm_version >= (6, 4):
             if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx950"]):  # TODO: more arches, "gfx942" gives error on pytorch nightly 2.10 1013 rocm7.0
                 SUPPORT_FP8_OPS = True
@@ -1360,8 +1383,13 @@ STREAM_CAST_BUFFERS = {}
 LARGEST_CASTED_WEIGHT = (None, 0)
 STREAM_AIMDO_CAST_BUFFERS = {}
 LARGEST_AIMDO_CASTED_WEIGHT = (None, 0)
+CROSS_STEP_STATE = weakref.WeakSet()
 
 DEFAULT_AIMDO_CAST_BUFFER_RESERVATION_SIZE = 16 * 1024 ** 3
+
+# NOTE: devs/agents: this is temporary and will be removed in a future comfy. Not supported for custom node use.
+def _register_cross_step(module):
+    CROSS_STEP_STATE.add(module)
 
 def get_cast_buffer(offload_stream, device, size, ref):
     global LARGEST_CASTED_WEIGHT
@@ -1416,6 +1444,10 @@ def reset_cast_buffers():
     for mmap_obj in DIRTY_MMAPS:
         mmap_obj.bounce()
     DIRTY_MMAPS.clear()
+
+    for module in CROSS_STEP_STATE:
+        del module._comfy_cross_step_state
+    CROSS_STEP_STATE.clear()
 
     for loaded_model in current_loaded_models:
         model = loaded_model.model
@@ -1744,9 +1776,9 @@ def get_free_memory(dev=None, torch_free_too=False):
             stats = torch.xpu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
-            mem_free_xpu = torch.xpu.get_device_properties(dev).total_memory - mem_reserved
+            mem_free_xpu, mem_total_xpu = xpu_get_memory_info(dev, mem_reserved)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_xpu + mem_free_torch
+            mem_free_total = min(mem_free_xpu + mem_free_torch, mem_total_xpu)
         elif is_ascend_npu():
             stats = torch.npu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
